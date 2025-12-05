@@ -1,398 +1,130 @@
-# **Speech-to-Insights**
+# Minutes 🎙️
 
-### **End-to-End Audio → Transcript → Embeddings → Semantic Search System**
+**Turn meeting recordings into actionable summaries in minutes, not hours.**
 
-Speech-to-Insights is a complete ML system that ingests audio, stores it in AWS S3, transcribes it using a reliable Whisper/FFmpeg pipeline, applies optional PII filtering, embeds text, indexes it, and exposes search and analytics features through a full frontend UI.
+Stop manually transcribing hours of meetings. Minutes uses AI to automatically transcribe audio files and generate structured summaries with speaker identification and key action items.
 
-This project was built for **MSML 650 – Machine Learning Systems** and is designed to satisfy the **Correct Operation of the Application** requirement with a fully demonstrable end-to-end flow.
+> 🎁 **Free to start**: Use AssemblyAI's free tier (up to 5 hours/month) and any OpenAI-compatible model including free options like Groq, DeepSeek, or local models.
 
----
+![Minutes Interface](screenshots/1-mainpage.jpeg)
 
-# **1. Project Overview**
+## ✨ What it does
 
-Modern teams generate large amounts of meeting audio. Reviewing it manually is slow, error-prone, and inefficient.
-Speech-to-Insights solves this by delivering a pipeline that:
+📁 **Upload audio** → 🤖 **AI transcribes** → ✏️ **Edit & label speakers** → 📋 **Get summary** → 📄 **Export markdown**
 
-1. Accepts audio uploads (web UI or API).
-2. Stores raw audio in an S3 input bucket.
-3. Transcribes audio into text without relying on external APIs.
-4. Writes a `result.json` to an output bucket.
-5. Embeds and indexes transcript segments.
-6. Supports semantic search across indexed sessions.
-7. Provides a clean UI for insights, sessions, analytics, and search.
+- **Drag & drop** audio files (MP3, WAV, M4A, etc.)
+- **Automatic transcription** with speaker detection
+- **Edit transcripts** and add speaker names/roles  
+- **AI-powered summaries** with action items and key points
+- **Export** clean markdown files for sharing
 
-This system is intentionally designed to be **robust even without external dependencies**. Whisper realtime and SageMaker Batch are implemented as optional integrations, but the demo flow relies on a **local transcription fallback** for reliability.
+<div align="center">
+  <img src="screenshots/2-editspeaker.jpeg" width="45%" />
+  <img src="screenshots/3-editsummary.jpeg" width="45%" />
+</div>
 
----
+## 🚀 Quick Start
 
-# **2. Architecture Summary**
-
-The platform is organized into four main layers:
-
-### **2.1 Ingestion**
-
-* Upload audio via FastAPI endpoint `/upload`
-* Or upload via frontend using presigned URLs
-* Input routed to `s3://<INPUT_BUCKET>/inputs/<run_id>/filename`
-
-### **2.2 Processing**
-
-* Local fallback transcription using FFmpeg audio normalization
-* Optional Whisper-style transcription
-* Output written to `s3://<OUTPUT_BUCKET>/outputs/<run_id>/result.json`
-
-### **2.3 Post-Processing**
-
-* Optional PII redaction
-* Embedding using sentence-transformers, OpenAI, or deterministic fallback
-* Chunked indexing using FAISS or numpy backend
-
-### **2.4 Retrieval & Insights**
-
-* Semantic search endpoint + UI search page
-* Session transcripts rendered from output bucket
-* Analytics UI with topic/speaker frequency (mock-supported)
-
-The system is fully functional **locally or on AWS**.
-
----
-
-# **3. Repository Structure**
-
-```
-backend/
-  app.py                  # FastAPI application setup
-  routes.py               # API endpoints
-  handlers.py             # Core upload + processing logic
-  lambda_handlers.py      # AWS Lambda-compatible handlers
-  transcribe.py           # FFmpeg normalization + local transcription fallback
-  whisper.py              # Optional Whisper/SageMaker inference integration
-  embedding.py            # Embedding backends
-  indexer.py              # Vector index, persistence, cosine similarity
-  pii_detector.py         # PII filtering framework
-
-  iam_policies.json
-  terraform_main.tf
-  terraform_vars.tf
-  deploy_lambdas.sh
-  local_run.sh
-  requirements.txt
-  test_api_upload.py
-  test_embedding_contract.py
-
-frontend/
-  *.html                  # Upload, search, analytics, sessions, admin, profile
-  css/                    # Styled components
-  js/                     # Page logic (upload.js, search.js, analytics.js, etc.)
-
-data/
-  docs/RUNBOOK.md
-  docs/GRADING_CHECKLIST.md
-```
-
----
-
-# **4. End-to-End Processing Pipeline (Detailed)**
-
-Below is the full flow executed when uploading audio.
-
----
-
-## **4.1 Upload → S3**
-
-Users upload audio via:
-
-* Web UI (upload.html)
-* Backend endpoint:
-
-  ```
-  POST /upload
-  Content-Type: multipart/form-data
-  ```
-
-The backend:
-
-* Validates the file
-* Generates a unique upload id
-* Saves the file to the S3 input bucket:
-
-  ```
-  s3://<INPUT_BUCKET>/inputs/<upload_id>/<filename>
-  ```
-
-Return payload example:
-
-```json
-{
-  "ok": true,
-  "upload_id": "a1b2c3",
-  "s3_uri": "s3://sti-input/.../file.wav",
-  "status": "uploaded"
-}
-```
-
----
-
-## **4.2 Automatic Local Transcription (Guaranteed Path)**
-
-After upload, the backend immediately runs the local fallback:
-
-1. Downloads the uploaded file
-2. Normalizes audio with FFmpeg
-3. Runs `transcribe_local_file()`
-4. Produces transcript text
-5. Writes a complete `result.json` to S3:
-
-```
-s3://<OUTPUT_BUCKET>/outputs/<upload_id>/result.json
-```
-
-Example JSON:
-
-```json
-{
-  "transcript": "Project kickoff meeting. Discussed budget, timeline...",
-  "duration_sec": 18.4,
-  "pii_redacted": false,
-  "segments": [...]
-}
-```
-
-This ensures **100 percent functional operation** even with no SageMaker.
-
----
-
-## **4.3 PII Detection (Optional)**
-
-`pii_detector.py` supports:
-
-* Email
-* Phone
-* Credit card
-* IP
-* SSN
-* URLs
-* spaCy entities (if installed)
-* AWS Comprehend (if enabled)
-
-Redaction is span-safe and optional.
-
----
-
-## **4.4 Embedding & Indexing**
-
-Transcript chunks are embedded using:
-
-* Sentence-Transformers
-* OpenAI embeddings
-* Deterministic fallback (default)
-
-Files created by indexer:
-
-```
-my_index.faiss
-my_index.npy
-my_index_meta.json
-my_index_ids.json
-```
-
-Searching:
-
-```python
-from backend.indexer import VectorIndex
-idx = VectorIndex.load("data/embeddings/index")
-results = idx.nearest_k("pricing discussion", 3)
-```
-
----
-
-## **4.5 Search & Insights UI**
-
-The frontend provides:
-
-* Semantic search
-* Session list
-* Transcript viewer
-* Topic frequency charts
-* Speaker participation metrics
-* Upload dashboard
-* Admin/debug panel
-
-Analytics gracefully degrade when backend metrics don’t exist.
-
----
-
-# **5. API Reference**
-
----
-
-### **POST /upload**
-
-Uploads audio; returns S3 paths and triggers automatic transcription.
-
----
-
-### **GET /presign**
-
-Returns presigned URL for PUT uploads.
-
----
-
-### **GET /status/{upload_id}**
-
-Retrieves processing state or final result.
-
----
-
-### **GET /health**
-
-Liveness probe.
-
----
-
-# **6. Local Development Setup**
-
-### Install Python dependencies:
+### Option 1: Docker (Recommended)
 
 ```bash
-pip install -r backend/requirements.txt
+# Clone and start
+git clone https://github.com/lyzgeorge/Minutes.git
+cd Minutes
+cp env.example .env
+
+# Add your API keys to .env
+# OPENAI_API_KEY=your_key_here
+# ASSEMBLYAI_API_KEY=your_key_here
+
+# Run with Docker
+docker compose -f docker-compose.simple.yml up -d
+
+# Open http://localhost:3000
 ```
 
-### Install FFmpeg:
-
-```
-brew install ffmpeg        # macOS
-sudo apt install ffmpeg    # Linux/WSL
-```
-
-### Run local server:
+### Option 2: Development
 
 ```bash
-./local_run.sh
+# Backend
+cd backend
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python main.py
+
+# Frontend (new terminal)
+cd frontend
+npm install && npm run dev
 ```
 
-### Run tests:
+## 💰 Cost-Effective Setup
+
+### Free Tier Options:
+- **AssemblyAI**: 5 hours free transcription/month
+- **OpenAI alternatives**: Use Groq, DeepSeek, or local models
+- **Hosting**: Deploy on your own server or free tiers
+
+### Paid Scaling:
+- **AssemblyAI**: $0.37/hour for additional transcription
+- **OpenAI**: ~$0.01 per summary with GPT-4o-mini
+
+## ⚙️ Configuration
+
+Create `.env` file:
 
 ```bash
-pytest -q
+# Required
+OPENAI_API_KEY=your_openai_key
+ASSEMBLYAI_API_KEY=your_assemblyai_key
+
+# Optional: Use alternative providers
+OPENAI_BASE_URL=https://api.groq.com/openai/v1  # Groq (free tier)
+# OPENAI_BASE_URL=https://api.deepseek.com      # DeepSeek (cheap)
+# OPENAI_BASE_URL=http://localhost:1234/v1      # Local model
+
+TEXT_MODEL_NAME=llama-3.1-8b-instant  # For Groq
+# TEXT_MODEL_NAME=deepseek-chat        # For DeepSeek
+# TEXT_MODEL_NAME=gpt-4o-mini         # For OpenAI
 ```
 
-### Test transcription manually:
+## 📸 Screenshots
 
-```bash
-./local_run.sh --test-transcribe sample.wav
-```
+| Main Interface | Summary Export |
+|---|---|
+| ![Upload](screenshots/1-mainpage.jpeg) | ![Export](screenshots/4-viewexport.jpeg) |
+
+## 🛠️ Technical Details
+
+**Stack**: FastAPI + Vue.js + SQLite + Docker  
+**AI Services**: AssemblyAI (transcription) + OpenAI-compatible APIs (summarization)  
+**Deployment**: Single container, runs anywhere
+
+### API Endpoints
+- `POST /upload` - Upload and transcribe audio
+- `GET /transcription/{id}` - Get transcription  
+- `POST /summarize/{id}` - Generate summary
+- `GET /export/{id}` - Download markdown
+
+### Supported Formats
+MP3, WAV, M4A, FLAC, OGG (auto-converted with FFmpeg)
+
+## 🤝 Contributing
+
+1. Fork the repo
+2. Create feature branch: `git checkout -b feature/amazing-feature`
+3. Commit changes: `git commit -m 'Add amazing feature'`
+4. Push branch: `git push origin feature/amazing-feature`
+5. Open Pull Request
+
+## 📄 License
+
+MIT License - feel free to use this commercially or personally.
+
+## 🔗 Links
+
+- **Issues**: [Report bugs](https://github.com/lyzgeorge/Minutes/issues)
+- **Discussions**: [Ask questions](https://github.com/lyzgeorge/Minutes/discussions)
 
 ---
 
-# **7. AWS Deployment (Minimal 10/10 Path)**
-
-This is the simplest reliable deployment for grading.
-
----
-
-## **7.1 Create buckets**
-
-```bash
-aws s3 mb s3://sti-input-<unique>
-aws s3 mb s3://sti-output-<unique>
-```
-
----
-
-## **7.2 Configure `.env`**
-
-```
-TRANSFORM_INPUT_BUCKET=sti-input-<unique>
-OUTPUT_S3_BUCKET=sti-output-<unique>
-TRANSFORM_INPUT_PREFIX=inputs
-OUTPUT_S3_PREFIX=outputs
-ALLOW_ORIGINS=*
-LOG_LEVEL=DEBUG
-```
-
-Optional:
-
-```
-SAGEMAKER_ENDPOINT=
-```
-
----
-
-## **7.3 Deploy backend**
-
-### **Option A — Elastic Beanstalk** (recommended)
-
-```bash
-eb init -p python-3.10 sti-backend
-eb create sti-backend-env --instance_type t3.small
-eb setenv $(cat .env | xargs)
-eb deploy
-```
-
-### **Option B — Lambda + API Gateway**
-
-```bash
-./deploy_lambdas.sh --role-arn arn:aws:iam::<acct>:role/LambdaExecRole
-```
-
-(Use ffmpeg layer or container-based Lambda.)
-
----
-
-## **7.4 Instructor Demo Steps (Guaranteed 10/10)**
-
-1. Go to frontend `upload.html`
-2. Upload a short audio file
-3. Show success JSON:
-
-   * `upload_id`
-   * `s3_uri`
-   * `result_s3_uri`
-4. Open output bucket → show `result.json`
-5. Open transcript in UI
-6. Use search page to query a phrase
-7. Show relevant matches
-
-This demonstrates:
-
-✔ Input ingestion
-✔ ML processing
-✔ Output generation
-✔ Storage on S3
-✔ Retrieval & search
-✔ Fully working application
-
----
-
-# **8. Environment Variables**
-
-| Variable               | Description               |
-| ---------------------- | ------------------------- |
-| TRANSFORM_INPUT_BUCKET | S3 input bucket           |
-| OUTPUT_S3_BUCKET       | S3 output bucket          |
-| TRANSFORM_INPUT_PREFIX | Prefix for raw audio      |
-| OUTPUT_S3_PREFIX       | Prefix for result data    |
-| ALLOW_ORIGINS          | CORS                      |
-| LOG_LEVEL              | Logging level             |
-| AWS_COMPREHEND_ENABLED | Optional PII              |
-| SAGEMAKER_ENDPOINT     | Optional Whisper realtime |
-| MAX_REALTIME_BYTES     | Realtime threshold        |
-
----
-
-# **9. Minimal Setup Summary**
-
-1. Install dependencies
-2. Install ffmpeg
-3. Create buckets
-4. Configure `.env`
-5. Run backend
-6. Upload audio
-7. Show transcript + search results
-
----
-
-# **10. License**
-
-MIT License.
+**⭐ Star this repo if it saves you time transcribing meetings!**

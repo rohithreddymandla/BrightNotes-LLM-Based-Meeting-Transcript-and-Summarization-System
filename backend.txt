@@ -1,0 +1,1037 @@
+backend/Dockerfile
+FROM python:3.12-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Expose port
+EXPOSE 8000
+
+# Start the application
+CMD ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"]
+================================================
+backend/main.py
+================================================
+# main.py - debugged: sanitize provider responses before returning to client
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Body, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+import os
+import tempfile
+import logging
+import json
+from datetime import datetime
+from pathlib import Path
+import signal
+import sys
+from typing import Optional, Any, Dict
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# SQLAlchemy Session typing for Depends
+from sqlalchemy.orm import Session
+
+# app logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("summeet")
+
+# --- Project imports (adapt paths if your layout differs) ---
+from models import get_db, Transcription
+
+# services must implement:
+#   - convert_to_mp3(path) -> path
+#   - transcribe_audio(path_or_s3_uri, upload_only=True) -> dict { s3_uri, file_size, optional text/speakers, optional provider_raw }
+#   - summarize_meeting(transcript, speaker_table, system_prompt_language, temperature) -> str
+#   - save_summary_as_markdown(transcript, summary, filename_base) -> filepath
+#   - generate_presigned_post(key) -> dict
+from services import (
+    convert_to_mp3,
+    transcribe_audio,
+    summarize_meeting,
+    save_summary_as_markdown,
+    generate_presigned_post,
+    TRANSFORM_INPUT_BUCKET,
+)
+
+app = FastAPI(title="Summeet API", version="1.0.0")
+
+# CORS (open for dev; tighten in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _safe(obj: Any) -> Any:
+    """
+    Return a JSON-serializable version of obj.
+    Strategy: json.dumps with default=str to coerce unknown objects to strings,
+    then json.loads back to Python primitives (dict/list/str/...).
+    """
+    try:
+        dumped = json.dumps(obj, default=str)
+        return json.loads(dumped)
+    except Exception:
+        # last-resort: return string repr
+        try:
+            return str(obj)
+        except Exception:
+            return "(unserializable)"
+
+
+@app.get("/")
+async def root():
+    return {"message": "Summeet API", "version": app.version}
+
+
+# --- Upload endpoint --------------------------------------------------------
+@app.post("/upload")
+async def upload_audio(
+    file: UploadFile = File(...),
+    transcribe: bool = Query(True, description="If true, run transcription after upload (requires provider configured)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Accept file upload, convert to mp3 if needed, upload to S3 (default) and optionally run transcription.
+    Default: transcribe=True so UI receives real text. Use ?transcribe=false to only upload.
+    """
+    tmp_path: Optional[str] = None
+    mp3_path: Optional[str] = None
+    upload_result: Optional[dict] = None
+
+    try:
+        # limit upload (configurable via env)
+        MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_BYTES", 100 * 1024 * 1024))  # 100MB default
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_FILE_SIZE} bytes.")
+
+        # write to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as fh:
+            fh.write(content)
+            tmp_path = fh.name
+        logger.info("Saved upload to temporary file: %s", tmp_path)
+
+        # convert (or shortcut if already mp3)
+        try:
+            mp3_path = convert_to_mp3(tmp_path)
+            logger.info("convert_to_mp3 returned: %s", mp3_path)
+        except Exception as ex:
+            logger.exception("convert_to_mp3 failed")
+            raise HTTPException(status_code=500, detail=f"convert_to_mp3 failed: {ex}")
+
+        if not mp3_path or not Path(mp3_path).exists():
+            raise HTTPException(status_code=500, detail="MP3 conversion failed: file missing")
+
+        # Call services.transcribe_audio:
+        # upload_only = not transcribe
+        try:
+            upload_result = transcribe_audio(mp3_path, upload_only=not transcribe)
+            logger.info(
+                "transcribe_audio returned keys: %s",
+                list(upload_result.keys()) if isinstance(upload_result, dict) else str(upload_result),
+            )
+        except TypeError:
+            logger.exception("transcribe_audio interface mismatch (upload_only flag missing)")
+            raise HTTPException(status_code=500, detail="transcribe_audio interface mismatch (expecting upload_only flag)")
+        except Exception as ex:
+            logger.exception("transcribe_audio failed")
+            raise HTTPException(status_code=500, detail=f"upload/transcribe step failed: {ex}")
+
+        # Normalize result fields and sanitize provider objects
+        s3_uri = None
+        transcript_text = None
+        speakers = []
+        provider_raw = None
+        upload_meta = None
+
+        if isinstance(upload_result, dict):
+            s3_uri = upload_result.get("s3_uri")
+            transcript_text = upload_result.get("text")
+            speakers = upload_result.get("speakers") or []
+            provider_raw = upload_result.get("provider_raw")
+            # sanitize upload_result for returning to client
+            upload_meta = _safe(upload_result)
+            # provider_raw may be nested inside upload_meta already; but ensure it's safe string too
+            if "provider_raw" in upload_meta:
+                upload_meta["provider_raw"] = _safe(upload_meta["provider_raw"])
+        else:
+            # fallback shape
+            upload_meta = _safe(upload_result)
+
+        transcript_text = transcript_text or (f"Uploaded to {s3_uri}" if s3_uri else "")
+        provider_raw_sanitized = _safe(provider_raw)
+
+        # Persist DB record
+        transcription = Transcription(
+            filename=file.filename,
+            transcript=transcript_text,
+            speakers=json.dumps(speakers),
+        )
+        db.add(transcription)
+        db.commit()
+        db.refresh(transcription)
+
+        return {
+            "id": transcription.id,
+            "filename": transcription.filename,
+            "transcript": transcription.transcript,
+            "speakers": transcription.speakers,
+            "created_at": transcription.created_at,
+            "upload_meta": upload_meta,
+            "provider_raw": provider_raw_sanitized,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error in /upload: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # best-effort cleanup
+        for p in (tmp_path, mp3_path):
+            try:
+                if p and Path(p).exists():
+                    Path(p).unlink()
+            except Exception:
+                logger.debug("Failed to delete temp file %s", p, exc_info=True)
+
+
+# --- Direct transcript save -----------------------------------------------
+class DirectTranscriptRequest(BaseModel):
+    filename: str
+    transcript: str
+    speakers: str = "[]"
+
+
+@app.post("/transcript")
+async def save_direct_transcript(request: DirectTranscriptRequest, db: Session = Depends(get_db)):
+    """Save user-provided transcript directly to DB."""
+    try:
+        transcription = Transcription(
+            filename=request.filename,
+            transcript=request.transcript,
+            speakers=request.speakers,
+        )
+        db.add(transcription)
+        db.commit()
+        db.refresh(transcription)
+        return {
+            "id": transcription.id,
+            "filename": transcription.filename,
+            "transcript": transcription.transcript,
+            "speakers": transcription.speakers,
+            "created_at": transcription.created_at
+        }
+    except Exception as e:
+        logger.exception("Error saving direct transcript")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Read, summarize and export --------------------------------------------
+@app.get("/transcription/{transcription_id}")
+async def get_transcription(transcription_id: int, db: Session = Depends(get_db)):
+    t = db.query(Transcription).filter(Transcription.id == transcription_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    return {
+        "id": t.id,
+        "filename": t.filename,
+        "transcript": t.transcript,
+        "speakers": t.speakers,
+        "summary": t.summary,
+        "created_at": t.created_at
+    }
+
+
+@app.post("/summarize/{transcription_id}")
+async def create_summary(transcription_id: int, language: str = "en", temperature: float = 0.8, db: Session = Depends(get_db)):
+    t = db.query(Transcription).filter(Transcription.id == transcription_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+
+    try:
+        speaker_table = None
+        if t.speakers:
+            try:
+                speakers_data = json.loads(t.speakers)
+                speaker_table = [[s.get("speaker", "Unknown"), s.get("description", "")] for s in speakers_data]
+            except Exception:
+                logger.warning("Could not parse speakers JSON for %s", transcription_id)
+
+        summary = summarize_meeting(t.transcript, speaker_table=speaker_table, system_prompt_language=language, temperature=temperature)
+        t.summary = summary
+        db.commit()
+        return {"summary": summary}
+    except Exception as e:
+        logger.exception("Error creating summary for %s", transcription_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/export/{transcription_id}")
+async def export_markdown(transcription_id: int, db: Session = Depends(get_db)):
+    t = db.query(Transcription).filter(Transcription.id == transcription_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+
+    try:
+        markdown_path = save_summary_as_markdown(t.transcript or "", t.summary or "", t.filename or f"meeting_{t.id}")
+        return FileResponse(markdown_path, media_type="text/markdown", filename=f"{t.filename or f'meeting_{t.id}'}_summary.md")
+    except Exception as e:
+        logger.exception("Error exporting markdown for %s", transcription_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Presign upload (browser -> S3) ---------------------------------------
+class PresignRequest(BaseModel):
+    filename: str
+
+
+@app.post("/s3/presign")
+async def presign_upload(req: PresignRequest = Body(...)):
+    """
+    Return a presigned POST payload for browser direct upload to S3.
+    """
+    try:
+        filename = req.filename
+        if not filename or not filename.strip():
+            raise HTTPException(status_code=400, detail="filename is required")
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        prefix = os.getenv("TRANSFORM_INPUT_PREFIX", "inputs").rstrip("/")
+        key = f"{prefix}/{timestamp}_{os.path.basename(filename)}"
+
+        presign = generate_presigned_post(key)
+        return {"presign": presign, "key": key, "bucket": TRANSFORM_INPUT_BUCKET}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to generate presigned POST")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- S3 trigger (client uploaded file) ------------------------------------
+class S3TriggerRequest(BaseModel):
+    s3_key: str
+    transcribe: Optional[bool] = False  # whether to run transcription after upload
+
+
+@app.post("/s3/trigger")
+async def s3_trigger(req: S3TriggerRequest, db: Session = Depends(get_db)):
+    """
+    Trigger post-upload processing for an existing object in S3.
+    This implementation stores a DB record referencing the S3 object.
+    If req.transcribe is True, attempts to call services.transcribe_audio(s3_uri, upload_only=False).
+    Note: your services.transcribe_audio must support S3 URIs for that flow; otherwise this may fail.
+    """
+    try:
+        s3_key = req.s3_key
+        if not s3_key or not s3_key.strip():
+            raise HTTPException(status_code=400, detail="s3_key is required")
+
+        if not TRANSFORM_INPUT_BUCKET:
+            raise HTTPException(status_code=500, detail="Server misconfigured: TRANSFORM_INPUT_BUCKET not set")
+
+        s3_uri = f"s3://{TRANSFORM_INPUT_BUCKET}/{s3_key.lstrip('/')}"
+        logger.info("Received S3 trigger for: %s", s3_uri)
+
+        transcript_text = f"Uploaded to {s3_uri}"
+        speakers_json = json.dumps([])
+        upload_meta = {"s3_uri": s3_uri}
+        provider_raw = None
+
+        if req.transcribe:
+            try:
+                result = transcribe_audio(s3_uri, upload_only=False)
+                transcript_text = result.get("text") or transcript_text
+                speakers_json = json.dumps(result.get("speakers") or [])
+                upload_meta = _safe(result)
+                provider_raw = _safe(result.get("provider_raw"))
+            except Exception as e:
+                logger.exception("Transcription from S3 failed for %s", s3_uri)
+                raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+
+        filename = os.path.basename(s3_key)
+        transcription = Transcription(
+            filename=filename,
+            transcript=transcript_text,
+            speakers=speakers_json
+        )
+        db.add(transcription)
+        db.commit()
+        db.refresh(transcription)
+
+        return {
+            "id": transcription.id,
+            "filename": transcription.filename,
+            "transcript": transcription.transcript,
+            "speakers": transcription.speakers,
+            "created_at": transcription.created_at,
+            "upload_meta": upload_meta,
+            "provider_raw": provider_raw,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in /s3/trigger")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Shutdown utilities ----------------------------------------------------
+def _signal_handler(sig, frame):
+    logger.info("Received shutdown signal. Gracefully shutting down.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    logger.info("🚀 Starting Summeet API...")
+    try:
+        uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", 8000)))
+    except KeyboardInterrupt:
+        logger.info("🛑 Server stopped by user")
+    except Exception as e:
+        logger.exception("❌ Server error during startup: %s", e)
+    finally:
+        logger.info("👋 Summeet API shutdown complete")
+
+=========================================================================
+backend/models.py
+=========================================================================
+
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+import os
+
+# Get data directory from environment variable, default to /app/data
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+
+# Ensure data directory exists
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# SQLite database configuration
+DATABASE_URL = f"sqlite:///{DATA_DIR}/database.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+class Transcription(Base):
+    __tablename__ = "transcriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, index=True)
+    transcript = Column(Text)
+    speakers = Column(Text)  # JSON string
+    summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    """Database dependency"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+=============================================
+backend/requirements.txt
+=============================================
+fastapi==0.104.1
+uvicorn==0.24.0
+sqlalchemy==2.0.23
+assemblyai==0.21.0
+openai==1.3.7
+python-multipart==0.0.6
+python-dotenv==1.0.0
+httpx==0.27.1
+=============================================
+backend/services.py
+=============================================
+# services.py - trimmed, no SageMaker. Uses AssemblyAI if available, otherwise chunked OpenAI fallback.
+import os
+import tempfile
+import subprocess
+import shutil
+import logging
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import certifi
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+# assemblyai (old preferred STT provider if configured)
+try:
+    import assemblyai as aai
+except Exception:
+    aai = None
+
+# openai client (new pipeline fallback)
+from openai import OpenAI
+
+logger = logging.getLogger("summeet.services")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# -------------------------
+# Configuration (from env)
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "gemini/gemini-2.0-flash")
+
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
+TRANSFORM_INPUT_BUCKET = os.getenv("TRANSFORM_INPUT_BUCKET")
+TRANSFORM_INPUT_PREFIX = os.getenv("TRANSFORM_INPUT_PREFIX", "inputs")
+OUTPUT_S3_BUCKET = os.getenv("TRANSFORM_OUTPUT_BUCKET") or os.getenv("OUTPUT_S3_BUCKET")
+PRESIGN_URL_EXPIRES = int(os.getenv("PRESIGN_URL_EXPIRES", "900"))
+
+# conservative realtime bytes threshold (5MB default)
+MAX_REALTIME_BYTES = int(os.getenv("MAX_REALTIME_BYTES", "5242880"))
+
+# OpenAI speech config
+OPENAI_SPEECH_MODEL = os.getenv("OPENAI_SPEECH_MODEL", "whisper-1")
+USE_OPENAI_TRANSCRIBE = os.getenv("USE_OPENAI_TRANSCRIBE", "true").lower() in ("1", "true", "yes")
+
+# Provider single-payload max bytes (observed ~26,214,400) - safe margin
+PROVIDER_MAX_BYTES = int(os.getenv("PROVIDER_MAX_BYTES", 25_000_000))
+
+# boto3 config
+VERIFY_PATH = os.getenv("AWS_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE") or certifi.where()
+BOTOCONFIG = Config(
+    region_name=AWS_REGION,
+    connect_timeout=int(os.getenv("BOTO_CONNECT_TIMEOUT", "60")),
+    read_timeout=int(os.getenv("BOTO_READ_TIMEOUT", "300")),
+    retries={"max_attempts": int(os.getenv("BOTO_MAX_RETRIES", "4")), "mode": "standard"},
+)
+
+# Initialize boto3 S3 client/resource
+try:
+    S3 = boto3.client("s3", region_name=AWS_REGION, config=BOTOCONFIG, verify=VERIFY_PATH)
+    S3_RESOURCE = boto3.resource("s3", region_name=AWS_REGION, config=BOTOCONFIG, verify=VERIFY_PATH)
+    logger.info("Boto3 S3 initialized (region=%s). S3 bucket: %s. verify=%s", AWS_REGION, TRANSFORM_INPUT_BUCKET, VERIFY_PATH)
+except Exception as e:
+    logger.exception("Failed to create boto3 S3 clients: %s", e)
+    S3 = None
+    S3_RESOURCE = None
+
+# Initialize AssemblyAI SDK if available
+if aai is not None:
+    try:
+        aai.settings.api_key = ASSEMBLYAI_API_KEY
+        aai.settings.http_timeout = int(os.getenv("ASSEMBLYAI_HTTP_TIMEOUT", "900"))
+        logger.info("AssemblyAI configured (api_key set: %s)", bool(ASSEMBLYAI_API_KEY))
+    except Exception:
+        logger.exception("Failed to configure AssemblyAI (SDK present but config failed)")
+else:
+    logger.info("AssemblyAI SDK not installed; skipping AssemblyAI configuration")
+
+# OpenAI client container
+client: Optional[OpenAI] = None
+
+def initialize_openai_client() -> bool:
+    global client
+    try:
+        if not OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not set")
+        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=120.0)
+        logger.info("OpenAI client initialized (base_url=%s, speech_model=%s)", OPENAI_BASE_URL, OPENAI_SPEECH_MODEL)
+        return True
+    except Exception as e:
+        client = None
+        logger.warning("OpenAI client init failed: %s", e)
+        return False
+
+_initialize_ok = initialize_openai_client()
+
+# -------------------------
+# Utility helpers
+# -------------------------
+def is_s3_uri(p: str) -> bool:
+    return isinstance(p, str) and p.startswith("s3://")
+
+def parse_s3_uri(uri: str):
+    if not is_s3_uri(uri):
+        raise ValueError("Not an s3:// URI")
+    path = uri[5:]
+    parts = path.split("/", 1)
+    bucket = parts[0]
+    key = parts[1] if len(parts) > 1 else ""
+    return bucket, key
+
+def download_s3_to_temp(s3_uri: str) -> str:
+    if S3 is None:
+        raise RuntimeError("S3 client not configured")
+    bucket, key = parse_s3_uri(s3_uri)
+    fd, tmp_path = tempfile.mkstemp(prefix="s3dl_", suffix="_" + Path(key).name)
+    os.close(fd)
+    try:
+        logger.info("Downloading %s -> %s", s3_uri, tmp_path)
+        S3.download_file(bucket, key, tmp_path)
+        return tmp_path
+    except Exception as e:
+        try:
+            Path(tmp_path).unlink()
+        except Exception:
+            pass
+        logger.exception("Failed to download from S3: %s", e)
+        raise RuntimeError(f"Failed to download {s3_uri}: {e}")
+
+# -------------------------
+# FFmpeg helpers
+# -------------------------
+def find_ffmpeg() -> Optional[str]:
+    env_path = os.getenv("FFMPEG_PATH")
+    if env_path:
+        p = Path(env_path)
+        if p.exists() and p.is_file():
+            return str(p)
+    for name in ("ffmpeg", "ffmpeg.exe"):
+        which = shutil.which(name)
+        if which:
+            return which
+    return None
+
+def run_cmd(cmd: List[str], capture_stderr=True):
+    try:
+        proc = subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return proc
+    except subprocess.CalledProcessError as cpe:
+        stderr = cpe.stderr.decode("utf-8", errors="replace") if cpe.stderr else ""
+        raise RuntimeError(stderr) from cpe
+
+def convert_to_mp3(input_path: str, target_samplerate: int = 16000) -> str:
+    """Convert input audio to MP3 (mono, target samplerate)."""
+    input_p = Path(input_path)
+    if not input_p.exists():
+        raise RuntimeError(f"Input file does not exist: {input_path}")
+    if input_p.suffix.lower() == ".mp3":
+        return str(input_p)
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found; set FFMPEG_PATH or install ffmpeg")
+    out_dir = input_p.parent if input_p.parent.exists() else Path(tempfile.gettempdir())
+    out_path = out_dir / (input_p.stem + "_converted.mp3")
+    cmd = [ffmpeg, "-y", "-i", str(input_p), "-ac", "1", "-ar", str(target_samplerate), "-vn", str(out_path)]
+    logger.info("Converting to mp3: %s ...", " ".join([Path(cmd[0]).name] + cmd[1:4]))
+    run_cmd(cmd)
+    if not out_path.exists():
+        raise RuntimeError("ffmpeg produced no MP3 file")
+    return str(out_path)
+
+def convert_to_wav_for_transcription(input_path: str, target_samplerate: int = 16000) -> str:
+    inp = Path(input_path)
+    if not inp.exists():
+        raise RuntimeError(f"Input does not exist: {input_path}")
+    if inp.suffix.lower() == ".wav":
+        return str(inp)
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found; set FFMPEG_PATH or install ffmpeg")
+    out_dir = inp.parent if inp.parent.exists() else Path(tempfile.gettempdir())
+    out_path = out_dir / (inp.stem + "_for_stt.wav")
+    cmd = [ffmpeg, "-y", "-i", str(inp), "-ac", "1", "-ar", str(target_samplerate), "-vn", "-acodec", "pcm_s16le", str(out_path)]
+    logger.info("Creating WAV for STT: %s ...", " ".join([Path(cmd[0]).name] + cmd[1:4]))
+    run_cmd(cmd)
+    if not out_path.exists():
+        raise RuntimeError("ffmpeg produced no wav file")
+    return str(out_path)
+
+def get_audio_duration_seconds(path: str) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        size = os.path.getsize(path)
+        estimate = max(1.0, size / 32000.0)
+        logger.warning("ffprobe not found; estimating duration from size: %.2fs", estimate)
+        return estimate
+    cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        dur = float(out.decode().strip())
+        return dur
+    except Exception:
+        size = os.path.getsize(path)
+        estimate = max(1.0, size / 32000.0)
+        logger.warning("ffprobe failed; falling back to estimate: %.2fs", estimate)
+        return estimate
+
+def split_wav_to_chunks(wav_path: str, max_bytes: int = PROVIDER_MAX_BYTES) -> List[str]:
+    wav = Path(wav_path)
+    if not wav.exists():
+        raise RuntimeError("WAV path missing: " + wav_path)
+    file_size = wav.stat().st_size
+    duration = get_audio_duration_seconds(wav_path)
+    logger.info("split_wav: size=%d bytes duration=%.2fs", file_size, duration)
+    if file_size <= max_bytes:
+        return [wav_path]
+    bps = file_size / max(0.001, duration)
+    target_seconds = max(5, int(max_bytes / bps))
+    if target_seconds < 5:
+        target_seconds = 5
+    if target_seconds >= int(duration):
+        return [wav_path]
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found (needed for splitting)")
+    out_dir = wav.parent
+    out_pattern = str(out_dir / (wav.stem + "_chunk_%03d.wav"))
+    cmd = [ffmpeg, "-y", "-i", str(wav), "-f", "segment", "-segment_time", str(target_seconds), "-c", "copy", out_pattern]
+    logger.info("Splitting WAV to chunks: target_seconds=%ds", target_seconds)
+    run_cmd(cmd)
+    chunks = sorted([str(p) for p in out_dir.glob(f"{wav.stem}_chunk_*.wav")])
+    final_chunks: List[str] = []
+    for ch in chunks:
+        sz = Path(ch).stat().st_size
+        if sz > max_bytes:
+            logger.warning("Chunk %s still > max_bytes (%d > %d). Further splitting.", ch, sz, max_bytes)
+            final_chunks.extend(split_wav_to_chunks(ch, max_bytes=max_bytes//2))
+            try:
+                Path(ch).unlink()
+            except Exception:
+                pass
+        else:
+            final_chunks.append(ch)
+    if not final_chunks:
+        return [wav_path]
+    return final_chunks
+
+def clean_temp_files(file_list: List[str]):
+    for file_path in file_list:
+        try:
+            if file_path and Path(file_path).exists():
+                Path(file_path).unlink()
+                logger.debug("Deleted temp file: %s", file_path)
+        except Exception as e:
+            logger.warning("Could not delete temp file %s: %s", file_path, e)
+
+# -------------------------
+# S3 helpers
+# -------------------------
+def upload_file_to_s3(local_path: str, key: str, bucket: str = None) -> str:
+    bucket = bucket or TRANSFORM_INPUT_BUCKET
+    if not bucket:
+        raise RuntimeError("TRANSFORM_INPUT_BUCKET not configured")
+    if S3 is None:
+        raise RuntimeError("S3 client not configured")
+    try:
+        S3.upload_file(local_path, bucket, key)
+        s3_uri = f"s3://{bucket}/{key}"
+        logger.info("Uploaded %s to %s", local_path, s3_uri)
+        return s3_uri
+    except Exception as e:
+        logger.exception("S3 upload failed: %s", e)
+        raise RuntimeError(f"S3 upload failed: {e}")
+
+def generate_presigned_post(key: str, bucket: str = None, expires_in: int = PRESIGN_URL_EXPIRES):
+    bucket = bucket or TRANSFORM_INPUT_BUCKET
+    if not bucket:
+        raise RuntimeError("TRANSFORM_INPUT_BUCKET not configured")
+    if S3 is None:
+        raise RuntimeError("S3 client not configured")
+    try:
+        post = S3.generate_presigned_post(bucket, key, ExpiresIn=expires_in)
+        logger.debug("Generated presigned POST for s3://%s/%s", bucket, key)
+        return post
+    except ClientError as e:
+        logger.exception("Presign generation failed: %s", e)
+        raise RuntimeError(f"Presign generation failed: {e}")
+
+# -------------------------
+# AssemblyAI transcription (old code) - prefer this if configured
+# -------------------------
+def transcribe_with_assemblyai(local_audio_path: str, word_boost: str = "", language: str = "auto") -> Dict[str, Any]:
+    if aai is None:
+        raise RuntimeError("AssemblyAI SDK not installed")
+    if not ASSEMBLYAI_API_KEY:
+        raise RuntimeError("ASSEMBLYAI_API_KEY not configured")
+
+    # convert to mp3 for upload (AssemblyAI prefers common formats)
+    mp3 = convert_to_mp3(local_audio_path)
+    logger.info("Uploading to AssemblyAI: %s", mp3)
+
+    # Build config
+    config_kwargs = {
+        "speaker_labels": True,
+        "language_detection": True if language == "auto" else False,
+        "language_code": None if language == "auto" else language,
+        "word_boost": [w.strip() for w in word_boost.split(",")] if word_boost else None,
+    }
+    config = aai.TranscriptionConfig(**{k: v for k, v in config_kwargs.items() if v is not None})
+    transcriber = aai.Transcriber()
+
+    transcript = transcriber.transcribe(mp3, config=config)
+    logger.info("AssemblyAI transcription submitted: id=%s status=%s", getattr(transcript, "id", None), getattr(transcript, "status", None))
+
+    # Wait / check status; SDK may return final completed object synchronously depending on settings
+    if getattr(transcript, "status", None) == aai.TranscriptStatus.completed:
+        # Build text
+        transcript_text = ""
+        speaker_set = set()
+        if getattr(transcript, "utterances", None):
+            for utterance in transcript.utterances:
+                speaker = utterance.speaker if getattr(utterance, "speaker", None) else "Unknown"
+                transcript_text += f"Speaker {speaker}: {utterance.text}\n"
+                speaker_set.add(speaker)
+        else:
+            transcript_text = getattr(transcript, "text", "(No speech detected or transcription empty)")
+            speaker_set.add("Unknown")
+
+        sorted_speakers = []
+        try:
+            sorted_speakers = sorted(list(speaker_set), key=lambda x: (int(x) if str(x).isdigit() else float('inf'), x))
+        except Exception:
+            sorted_speakers = sorted(list(speaker_set))
+
+        speakers_data = [{"speaker": s, "description": ""} for s in sorted_speakers]
+        return {"text": transcript_text, "speakers": speakers_data, "raw": transcript}
+    elif getattr(transcript, "status", None) == aai.TranscriptStatus.error:
+        raise RuntimeError(f"AssemblyAI transcription error: {getattr(transcript, 'error', 'unknown')}")
+    else:
+        # SDK might provide polling; surface that as an error here for now
+        raise RuntimeError(f"AssemblyAI returned intermediate status: {getattr(transcript, 'status', 'unknown')}")
+
+# -------------------------
+# OpenAI per-chunk transcription
+# -------------------------
+def transcribe_with_openai_chunk(audio_path: str, language: Optional[str] = None) -> Dict[str, Any]:
+    if client is None:
+        if not initialize_openai_client():
+            raise RuntimeError("OpenAI client not initialized")
+    # prefer file-like call
+    try:
+        with open(audio_path, "rb") as fh:
+            logger.info("Calling OpenAI transcription for chunk %s", audio_path)
+            response = client.audio.transcriptions.create(
+                model=OPENAI_SPEECH_MODEL,
+                file=fh,
+                language=language if language else None
+            )
+    except Exception as e_file:
+        logger.debug("file-like call failed: %s; trying bytes fallback", e_file)
+        try:
+            with open(audio_path, "rb") as fh2:
+                data = fh2.read()
+            response = client.audio.transcriptions.create(
+                model=OPENAI_SPEECH_MODEL,
+                file=data,
+                language=language if language else None
+            )
+        except Exception as e_bytes:
+            logger.exception("OpenAI transcription call failed for chunk: %s", e_bytes)
+            raise
+
+    # defensive extraction
+    text = None
+    try:
+        text = getattr(response, "text", None)
+        if not text and isinstance(response, dict):
+            text = response.get("text") or response.get("transcript")
+    except Exception:
+        text = None
+    if not text:
+        try:
+            if isinstance(response, dict) and "data" in response and isinstance(response["data"], list):
+                text = response["data"][0].get("text")
+        except Exception:
+            text = None
+    if not text:
+        try:
+            text = str(response)
+        except Exception:
+            text = "(no text extracted)"
+    return {"text": text, "raw": response}
+
+# -------------------------
+# Main transcribe_audio (uploads + chooses provider)
+# -------------------------
+def transcribe_audio(audio_file: str, upload_only: bool = True, word_boost: str = "", language: str = "en") -> Dict[str, Any]:
+    """
+    Accept local path or s3:// URI.
+    - upload_only=True -> upload an mp3 to S3 and return {'s3_uri', 'file_size'}
+    - upload_only=False -> attempt to transcribe using AssemblyAI if configured, else chunked OpenAI fallback
+    """
+    if not audio_file:
+        raise ValueError("No audio file provided")
+
+    created_temp: List[str] = []
+    try:
+        # download s3 if given
+        local_in = audio_file
+        if is_s3_uri(audio_file):
+            local_in = download_s3_to_temp(audio_file)
+            created_temp.append(local_in)
+
+        # convert to mp3 for storage/upload
+        mp3_path = convert_to_mp3(local_in)
+        if mp3_path != local_in:
+            created_temp.append(mp3_path)
+
+        # upload mp3 to S3
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = Path(mp3_path).name
+        key = f"{TRANSFORM_INPUT_PREFIX.rstrip('/')}/{timestamp}_{filename}"
+        s3_uri = upload_file_to_s3(mp3_path, key)
+        file_size = os.path.getsize(mp3_path)
+        logger.info("Uploaded and ready: %s (size=%d bytes)", s3_uri, file_size)
+
+        base = {"s3_uri": s3_uri, "file_size": file_size}
+
+        if upload_only:
+            return base
+
+        # Prefer AssemblyAI if configured
+        if aai is not None and ASSEMBLYAI_API_KEY:
+            logger.info("Using AssemblyAI for transcription")
+            try:
+                aa_result = transcribe_with_assemblyai(mp3_path, word_boost=word_boost, language=language if language != "auto" else "auto")
+                # aa_result: {'text':..., 'speakers': [...], 'raw': ...}
+                text = aa_result.get("text") or ""
+                speakers = aa_result.get("speakers") or []
+                provider_raw = aa_result.get("raw")
+                return {**base, "text": text, "speakers": speakers, "provider_raw": provider_raw}
+            except Exception as e:
+                logger.exception("AssemblyAI transcription failed; falling back to chunked OpenAI: %s", e)
+
+        # Fallback: chunked OpenAI transcription
+        if not USE_OPENAI_TRANSCRIBE:
+            logger.info("No STT provider configured; returning upload-only metadata")
+            return base
+
+        logger.info("Using chunked OpenAI transcription fallback")
+        wav_for_stt = convert_to_wav_for_transcription(mp3_path, target_samplerate=16000)
+        if wav_for_stt != mp3_path:
+            created_temp.append(wav_for_stt)
+
+        wav_size = os.path.getsize(wav_for_stt)
+        logger.info("WAV for STT size=%d bytes", wav_size)
+
+        chunk_paths = [wav_for_stt]
+        if wav_size > PROVIDER_MAX_BYTES:
+            logger.info("WAV exceeds provider limit (%d > %d). Splitting...", wav_size, PROVIDER_MAX_BYTES)
+            chunk_paths = split_wav_to_chunks(wav_for_stt, max_bytes=PROVIDER_MAX_BYTES)
+            logger.info("Created %d chunks", len(chunk_paths))
+
+        combined_texts: List[str] = []
+        provider_raw_list: List[Any] = []
+        for idx, ch in enumerate(chunk_paths):
+            try:
+                chunk_res = transcribe_with_openai_chunk(ch, language=(None if language == "auto" else language))
+                combined_texts.append(chunk_res.get("text") or "")
+                provider_raw_list.append(chunk_res.get("raw"))
+            except Exception as e:
+                logger.exception("Chunk transcription failed (index=%d): %s", idx, e)
+                provider_raw_list.append({"chunk_error": str(e)})
+                combined_texts.append("(error transcribing chunk)")
+
+        final_text = "\n".join([t for t in combined_texts if t]).strip()
+        result = {**base, "text": final_text, "speakers": [], "provider_raw": provider_raw_list}
+        logger.info("transcribe_audio returned keys: %s", list(result.keys()))
+        return result
+
+    except Exception as e:
+        logger.exception("Error during upload/transcription process")
+        raise RuntimeError(f"Error during upload/transcription process: {e}")
+    finally:
+        # cleanup temps
+        try:
+            for p in created_temp:
+                try:
+                    if Path(p).exists():
+                        Path(p).unlink()
+                except Exception:
+                    logger.debug("Failed removing temp %s", p, exc_info=True)
+        except Exception:
+            logger.debug("cleanup error", exc_info=True)
+
+# -------------------------
+# Summarization + save helpers (unchanged)
+# -------------------------
+SYSTEM_PROMPTS = {
+    "en": "...",
+    "cn": "..."
+}
+
+def summarize_meeting(transcript: str, speaker_table: Optional[List[List[str]]] = None, system_prompt_language: str = "en", temperature: float = 0.8) -> str:
+    if not transcript or transcript.strip() == "" or transcript.strip() == "(No speech detected or transcription empty)":
+        return "No transcript available to summarize."
+    if client is None:
+        logger.warning("OpenAI client None; trying to reinit")
+        if not initialize_openai_client():
+            raise RuntimeError("OpenAI client not initialized")
+    system_prompt = SYSTEM_PROMPTS.get(system_prompt_language, SYSTEM_PROMPTS.get("en", ""))
+    try:
+        speaker_info_str = ""
+        if speaker_table:
+            speaker_info_str = "\n\nSpeaker Information:\n" + "\n".join(
+                [f"Speaker {row[0]}: {row[1]}" for row in speaker_table if len(row) > 1 and row[1].strip()]
+            )
+        content = f"Transcription:\n{transcript}\n----{speaker_info_str}"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content}
+        ]
+        logger.info("Sending summarization request")
+        response = client.chat.completions.create(model=TEXT_MODEL_NAME, messages=messages, temperature=temperature)
+        summary = None
+        try:
+            summary = response.choices[0].message.content.strip()
+        except Exception:
+            summary = getattr(response, "text", None) or str(response)
+        if not summary:
+            return "(Summary generation failed or produced empty result)"
+        return summary
+    except Exception as e:
+        logger.exception("Summarization error")
+        raise RuntimeError(f"Summarization error: {e}")
+
+def save_summary_as_markdown(transcript: str, summary: str, filename_base: Optional[str] = None) -> str:
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{(filename_base or 'meeting')}_{now_str}.md"
+    save_dir = os.path.join(tempfile.gettempdir(), "meeting_summaries")
+    os.makedirs(save_dir, exist_ok=True)
+    file_path = os.path.join(save_dir, filename)
+    content = f"## {filename_base or 'Meeting'} - {now_str}\n\n***\n\n### Summary\n\n{summary}\n\n"
+    if transcript:
+        content += f"\n\n***\n\n### Full Transcript\n\n{transcript}\n\n"
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info("Summary saved to: %s", file_path)
+        return file_path
+    except Exception as e:
+        logger.exception("Error saving markdown file")
+        raise RuntimeError(f"Error saving markdown file: {e}")
