@@ -1,112 +1,135 @@
-# **Speech-to-Insights: Minutes AI**
+# **Speech-to-Insights (BrightNotes Edition)**
 
-Turn raw meeting audio into structured, editable, and searchable insights.
+Turn long meeting recordings into clean transcripts, structured summaries, and exportable insights.
 
-Minutes AI is a full-stack system that ingests meeting recordings, transcribes them, detects speakers, summarizes conversations, and exports clean transcripts. It runs fully locally with FastAPI + Vue, with optional AWS S3 + Step Functions alignment for a serverless future.
+This project runs fully locally with FastAPI + Vue, and optionally integrates with AWS S3 for storage and serverless workflows.
 
 ---
 
 # **📸 UI Screenshots**
 
-These images come directly from your repo’s `Screenshots/` folder.
-
-### **Start New Meeting Session**
+### Start a new session
 
 ![Start Session](https://raw.githubusercontent.com/Akash-Kadali/Speech-to-Insights/main/Screenshots/1.png)
 
----
-
-### **Audio Upload Processing**
+### Audio upload
 
 ![Audio Upload](https://raw.githubusercontent.com/Akash-Kadali/Speech-to-Insights/main/Screenshots/2.png)
 
----
-
-### **Transcript Editor + Speaker Management**
+### Transcript editor
 
 ![Transcript Editor](https://raw.githubusercontent.com/Akash-Kadali/Speech-to-Insights/main/Screenshots/3.png)
 
----
-
-### **Generated Summary View**
+### Summary view
 
 ![Summary View](https://raw.githubusercontent.com/Akash-Kadali/Speech-to-Insights/main/Screenshots/4.png)
 
----
-
-### **Final Meeting Details Page**
+### Final meeting details
 
 ![Final Output](https://raw.githubusercontent.com/Akash-Kadali/Speech-to-Insights/main/Screenshots/5.png)
 
 ---
 
-# **🔥 Overview**
+# **Overview**
 
-Minutes AI converts messy audio into clean meeting intelligence:
+Speech-to-Insights processes any meeting audio into a structured record:
 
-* Audio upload and preprocessing
-* Whisper-style STT via OpenAI-compatible API
-* Optional AssemblyAI fallback
-* Speaker detection and manual editing
-* PII-aware cleaning and utilities
-* Structured LLM-generated summary
-* Keywords and sentiment extraction
-* Export to TXT, Markdown, SRT
-* Optional S3 mirroring for serverless workflows
+* Upload and normalize audio
+* Convert to mp3/wav via ffmpeg
+* Chunked or full STT using
 
----
+  * OpenAI Whisper (`whisper-1`) or
+  * AssemblyAI (if configured)
+* Speaker metadata
+* Clean transcript stored in SQLite
+* LLM summary generation
+* Export to Markdown, TXT, SRT
+* Optional S3 storage for input audio and output summaries
+* Browser-to-S3 presigned uploads
 
-# **🚀 Core Features**
-
-### **Audio Ingestion**
-
-* Upload MP3, WAV, M4A, FLAC
-* ffmpeg normalization
-* Chunked processing for large recordings
-
-### **Transcription**
-
-* Whisper-style STT pipeline
-* Automatic chunk merging
-* Speaker diarization (when supported)
-
-### **Storage**
-
-* SQLite + SQLAlchemy
-* Immutable, timestamped output files
-* Optional S3 mirroring of all inputs/outputs
-
-### **Summaries & Insights**
-
-* Structured summary with action items
-* Keyword extraction
-* Sentiment scoring
-* PII-aware cleaning
-* SRT subtitle generation
-
-### **Frontend UI**
-
-* Vue 3 + Vite + Tailwind
-* Upload → Transcript → Summary workflow
-* Speaker renaming
-* Markdown preview
-* Export options (TXT / MD / SRT)
+Backend is FastAPI.
+Frontend is Vue 3 + Vite + Tailwind.
+Deployment uses Nginx as a static server + API proxy.
 
 ---
 
-# **⚙️ Quick Start**
+# **Features**
 
-## Backend
+### Audio ingestion
+
+* Supports MP3, WAV, M4A, FLAC
+* Automatic ffmpeg conversion
+* File size checks
+* Chunk splitting for large audio (based on provider limits)
+
+### Transcription
+
+* AssemblyAI transcription with diarization
+* OpenAI Whisper chunked fallback
+* S3 upload path preserved
+* Provider response sanitized before returning to UI
+
+### Storage
+
+* SQLite database at `/app/data/database.db`
+* SQLAlchemy models manage transcripts and summaries
+
+### Summaries
+
+* LLM summary using configurable OpenAI endpoint
+* Speaker-aware summary generation
+* Deterministic output file naming
+* TXT + MD saved locally and optionally uploaded to S3
+
+### Frontend
+
+* Vite + Vue 3
+* Axios API calls
+* Markdown editor via `@xiangfa/mdeditor` 
+* Proxy config `/api -> http://localhost:8000` (vite config) 
+* TailwindCSS + PostCSS config included 
+* `index.html` updated branding and metadata 
+
+---
+
+# **Project Structure**
+
+```
+backend/
+   main.py
+   models.py
+   services.py
+   requirements.txt
+   data/ (auto-created for SQLite)
+frontend/
+   src/
+   index.html
+   vite.config.js
+   tailwind.config.js
+   postcss.config.js
+nginx/
+   nginx.conf
+Screenshots/
+Dockerfile
+```
+
+---
+
+# **Backend Setup**
 
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate       # Windows: venv\Scripts\activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## Frontend
+Dependencies include FastAPI, SQLAlchemy, boto3, AssemblyAI, OpenAI, ffmpeg, etc. 
+
+---
+
+# **Frontend Setup**
 
 ```bash
 cd frontend
@@ -114,99 +137,137 @@ npm install
 npm run dev
 ```
 
-Open:
-`http://localhost:5173`
+Opens at:
+
+```
+http://localhost:5173
+```
+
+Vite proxy automatically maps frontend `/api/*` calls → FastAPI backend. 
 
 ---
 
-# **🔧 Backend Configuration (`backend/.env`)**
+# **Environment Variables**
 
-```env
-OPENAI_API_KEY=your_openai_key
-ASSEMBLYAI_API_KEY=your_assembly_key
+Backend expects:
 
-TEXT_MODEL_NAME=gpt-4o-mini
+```
+OPENAI_API_KEY=
+ASSEMBLYAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
+TEXT_MODEL_NAME=gpt-4o-mini
+OPENAI_SPEECH_MODEL=whisper-1
 
-MAX_REALTIME_BYTES=524288000
+AWS_REGION=us-east-2
+TRANSFORM_INPUT_BUCKET=
+TRANSFORM_OUTPUT_BUCKET=
 PRESIGN_URL_EXPIRES=900
 
-TRANSFORM_INPUT_BUCKET=your-input-bucket
-OUTPUT_S3_BUCKET=your-output-bucket
-TRANSFORM_OUTPUT_BUCKET=your-output-bucket
-AWS_REGION=us-east-2
+MAX_REALTIME_BYTES=5242880
+PROVIDER_MAX_BYTES=25000000
 
-STATE_MACHINE_ARN=
-NOTIFY_SNS_TOPIC_ARN=
-
-ALLOW_ORIGINS=http://localhost:5173,http://127.0.0.1:8000
+ALLOW_ORIGINS=http://localhost:5173
 ```
 
 ---
 
-# **📡 API Endpoints**
+# **API Endpoints**
 
-| Method | Route                 | Purpose                     |
-| ------ | --------------------- | --------------------------- |
-| POST   | `/upload`             | Upload + transcribe audio   |
-| GET    | `/transcription/{id}` | Fetch transcript            |
-| POST   | `/summarize/{id}`     | Generate structured summary |
-| GET    | `/export/{id}`        | Export summary (Markdown)   |
-| GET    | `/export/{id}/srt`    | Export subtitles            |
-| GET    | `/sentiment/{id}`     | Sentiment analysis          |
-| GET    | `/keywords/{id}`      | Keyword extraction          |
-| POST   | `/transcript`         | Save raw transcript         |
+### Upload
+
+POST `/upload`
+Uploads audio, converts to mp3, stores in S3, optionally runs transcription.
+
+### Get transcription
+
+GET `/transcription/{id}`
+
+### Summarize
+
+POST `/summarize/{id}`
+Uses LLM + speaker table from database.
+
+### Export Markdown
+
+GET `/export/{id}`
+Returns S3 link or local MD file.
+
+### Save transcript manually
+
+POST `/transcript`
+
+### Create presigned upload URL
+
+POST `/s3/presign`
+
+These endpoints all come from `main.py`. 
 
 ---
 
-# **🧩 Architecture Flow**
+# **How the System Works**
 
 ```
-Frontend (Vue)
-   ↓
-Audio Upload
-   ↓
-FastAPI Ingestion + ffmpeg
-   ↓
-Chunked STT (OpenAI or AssemblyAI)
-   ↓
-SQLite storage
-   ↓
-LLM Summary Generation
-   ↓
-TXT / MD / SRT Exports
-   ↓
-Optional S3 Mirror
+Frontend → FastAPI → services.py pipeline
+
+1. Upload file
+2. Convert via ffmpeg
+3. Upload mp3 to S3
+4. If transcribe=True:
+       AssemblyAI → or OpenAI Whisper chunked STT
+5. Store text + speakers in SQLite
+6. On summary:
+       LLM generates structured summary
+7. Deterministic artifact saving:
+       outputs/Transcripts/timestamp.txt
+       outputs/Summary/timestamp.md
+8. Upload to S3 if OUTPUT_S3_BUCKET set
 ```
 
----
-
-# **🔒 Security**
-
-* No keys in source control
-* Sanitized logs
-* Strict CORS settings
-* Presigned URL expiration
-* Temporary file cleanup
-* Dev-only IAM credentials clearly marked
+Everything here is based directly on your backend processing pipeline. 
 
 ---
 
-# **🛠 Tech Stack**
+# **Nginx Deployment**
 
-**Backend:** FastAPI, SQLAlchemy, ffmpeg, boto3, OpenAI-compatible APIs
-**Frontend:** Vue 3, Vite, TailwindCSS
-**Cloud (Optional):** AWS S3, Step Functions, SNS
+Your nginx config supports:
+
+* SPA routing
+* Long-lived caching for JS/CSS
+* `/api` reverse proxy to backend
+* Optional HTTPS block
+* Brotli/gzip compression
+
+See full config: 
 
 ---
 
-# **🏁 Project Outcomes**
+# **Security**
 
-This system is production-aligned and delivers:
+* Sanitized provider responses
+* No API keys in source
+* CORS configured with explicit origins
+* Temp file cleanup for all uploads
+* S3 objects isolated by timestamped keys
+* SQLite stored in a dedicated `/app/data` directory created at runtime 
 
-* Complete STT pipeline
-* Strong UI for reviewing/editing transcripts
-* Actionable meeting summaries
-* Clean exports
-* AWS-aligned design
-* Local-first privacy-protecting workflow
+---
+
+# **Tech Stack**
+
+**Backend:** FastAPI, SQLAlchemy, boto3, AssemblyAI, OpenAI, ffmpeg
+**Frontend:** Vue 3, Vite, Tailwind, Markdown editor
+**Storage:** SQLite (local), S3 (optional)
+**Infra:** Docker + Nginx reverse proxy
+
+---
+
+# **Outcome**
+
+You get a clean, deterministic workflow:
+
+✓ Audio → Transcript
+✓ Transcript → Speaker-aware Summary
+✓ Exportable Markdown / TXT / SRT
+✓ Local or S3 storage
+✓ Deployable stack with Nginx + Docker
+✓ Fully reproducible artifacts
