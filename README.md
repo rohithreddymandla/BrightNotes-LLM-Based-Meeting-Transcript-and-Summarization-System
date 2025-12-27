@@ -2,7 +2,7 @@
 
 Turn long meeting recordings into clean transcripts, structured summaries, and exportable insights.
 
-This project runs fully locally with FastAPI + Vue, and optionally integrates with AWS S3 for storage and serverless workflows.
+This project runs fully locally with FastAPI + Vue, and integrates with AWS S3 for storage and serverless workflows.
 
 ---
 
